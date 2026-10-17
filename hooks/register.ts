@@ -4,6 +4,7 @@ import { statusIcons } from './status-icons'
 const TTL_MS = 60 * 60 * 1000
 const PING_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
+const MAX_RETRIES = 3
 const AUTO_WARM_MS = 3 * 60 * 60 * 1000
 const DEFAULT_WINDOW_MS = 6 * 60 * 60 * 1000
 const BIG_TOKENS = 50000
@@ -13,16 +14,37 @@ const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
 
-// $ per million tokens, [cache read, 1h cache write, output], list prices September 2026.
-// Longer family names first: a model id matches the first row it contains.
-const PRICES: Array<[string, number, number, number]> = [
+// Prompts no person sent, so nobody could send them again after a refusal. Every
+// other origin, including sdk, unclassified and the owner's own Slack or channel
+// messages, may carry a person's words and keeps the guard.
+const UNATTENDED = new Set(['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'projects-relay', 'coordinator', 'observer', 'observer-activity'])
+
+const LONG_PROMPT_TOKENS = 100000
+
+// $ per million tokens, [cache read, 1h cache write, output], list prices October 2026.
+// More specific families first: a model id takes the first row it matches.
+const PRICES: Array<[string | RegExp, number, number, number]> = [
   ['fable-5-1', 0.25, 20, 50],
+  ['mythos-5-1', 0.25, 20, 50],
   ['fable-5', 1, 20, 50],
+  ['mythos-5', 1, 20, 50],
+  ['opus-5-5', 0.2, 8, 20],
   ['opus-5', 0.5, 10, 25],
+  // Opus 4 and 4.1 in every spelling (claude-opus-4-1-20250805, claude-opus-4@20250514, the -0 and -1 aliases), never Opus 4.5 and later.
+  [/opus-4(?:-[01])?(?:$|[^-\d]|-20\d{6})/, 1.5, 30, 75],
   ['opus-4', 0.5, 10, 25],
+  ['sonnet-5-5', 0.1, 4, 10],
   ['sonnet-5', 0.2, 4, 10],
   ['sonnet', 0.3, 6, 15],
+  ['haiku-5-5', 0.01, 0.2, 0.5],
+  ['3-5-haiku', 0.08, 1.6, 4],
+  ['haiku-3-5', 0.08, 1.6, 4],
   ['haiku', 0.1, 2, 5],
+]
+
+// A request whose prompt, cache reads and writes included, is over 100k tokens pays these instead.
+const LONG_PRICES: Array<[string, number, number, number]> = [
+  ['haiku-5-5', 0.05, 1, 2.5],
 ]
 
 type PingRecord = { at: number; read: number; write: number; usd: number | null; warm: boolean }
@@ -46,11 +68,23 @@ export type State = {
   pending: { cancel: () => void } | null
   last: PingRecord | null
   stopped: string | null
+  waitForTurn: boolean
+  retries: number
+  retryReason: string
+  gen: number
+  tick: number
+  inFlight: boolean
+  stepWrites: { usd: number; priced: boolean } | null
 }
 
-function priceOf(model: string | null): [number, number, number] | null {
+function priceOf(model: string | null, promptTokens: number): [number, number, number] | null {
   const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
-  for (const [family, read, write, output] of PRICES) if (m.includes(family)) return [read, write, output]
+  if (promptTokens > LONG_PROMPT_TOKENS) {
+    for (const [family, read, write, output] of LONG_PRICES) if (m.includes(family)) return [read, write, output]
+  }
+  for (const [family, read, write, output] of PRICES) {
+    if (typeof family === 'string' ? m.includes(family) : family.test(m)) return [read, write, output]
+  }
   return null
 }
 
@@ -77,12 +111,12 @@ function fmtTok(n: number): string {
 }
 
 function coldUsd(s: State): number | null {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   return price ? s.ctx * price[1] / 1e6 : null
 }
 
 function warmUsd(s: State): number | null {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   return price ? s.ctx * price[0] / 1e6 : null
 }
 
@@ -93,7 +127,7 @@ function pingUsd(u: { input_tokens: number; output_tokens: number; cache_read_in
 
 /** The read-only upper bound: pings at the cache-read rate that cost as much as one cold write of the same context. */
 function breakEvenPings(s: State): number | null {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   if (!price || s.ctx <= 0) return null
   return Math.floor(price[1] / price[0])
 }
@@ -103,7 +137,7 @@ function isCold(s: State, now: number): boolean {
 }
 
 function guardText(s: State, now: number): string {
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, s.ctx)
   const rate = price ? `$${price[1]}/MTok` : 'the cache-write rate'
   const warm = warmUsd(s)
   return `the prompt cache went cold ${fmtDuration(now - s.lastRequestAt - TTL_MS)} ago. Sending this re-writes ` +
@@ -128,6 +162,9 @@ export function resetForClear(s: State) {
   s.ackedAt = 0
   s.coldWritePending = false
   s.misses = []
+  s.waitForTurn = false
+  s.stepWrites = null
+  outdate(s)
   disarm(s)
 }
 
@@ -150,6 +187,8 @@ function statusText(s: State, now: number): string | undefined {
   const nextText = !s.lastRequestAt ? ' · waiting for the first turn'
     : s.compacted ? ' · waiting for the first turn after compaction'
     : isCold(s, now) ? ` · cold now, first ping ${fmtDuration(s.every)} after the next turn`
+    : s.waitForTurn ? ' · nothing to fork yet, first ping after the next turn'
+    : s.retries ? ` · API busy, ping retry ${s.retries} of ${MAX_RETRIES}`
     : ` · ping in ${fmtDuration(s.lastRequestAt + s.every - now)}`
   return `keepwarm ${fmtDuration(s.deadline - now)} left${nextText}${pingText}`
 }
@@ -159,9 +198,16 @@ function updateStatus($: EngineInterface, s: State, now: number) {
   else $.ui.status(statusText(s, now))
 }
 
+/** Cancels the timer. Every new timer is set right after this, so the tick also says the schedule changed. */
 function disarm(s: State) {
   if (s.pending) s.pending.cancel()
   s.pending = null
+  s.tick++
+}
+
+/** Outdates any ping in flight: /clear, a resume, compaction or stop replaced the state it was sent for. Re-arming or extending the window does not, so a ping out at that moment still counts; a main request outdates it through the request clock. */
+function outdate(s: State) {
+  s.gen++
 }
 
 // The window and its ping period belong to the session that armed them, so a
@@ -190,6 +236,8 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   s.deadline = 0
   s.every = PING_AFTER_MS
   s.stopped = why
+  s.retries = 0
+  outdate(s)
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
@@ -202,14 +250,23 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
 
 async function arm($: EngineInterface, s: State) {
   disarm(s)
+  s.retries = 0
   if (!s.deadline) return
   const now = await $.clock.now()
+  // A timer set while the clock was read, such as a retry, is replaced here, never left running beside this one;
+  // from this line to the assignment below nothing awaits.
+  disarm(s)
+  s.retries = 0
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
   if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
     const untilCold = s.lastRequestAt + TTL_MS - now
-    const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + s.every - now))
-    s.pending = $.clock.after(delay, () => { void ping($, s) })
+    // Waiting for a turn sends nothing, but wakes when the cache goes cold so the row says so.
+    if (s.waitForTurn) s.pending = $.clock.after(Math.min(s.deadline - now, untilCold), () => { void arm($, s) })
+    else {
+      const delay = Math.min(s.deadline - now, untilCold, Math.max(1000, s.lastRequestAt + s.every - now))
+      s.pending = $.clock.after(delay, () => { void ping($, s) })
+    }
   } else {
     s.pending = $.clock.after(s.deadline - now, () => { void arm($, s) })
   }
@@ -219,27 +276,59 @@ async function arm($: EngineInterface, s: State) {
 async function ping($: EngineInterface, s: State) {
   s.pending = null
   if (!s.deadline) return
+  const tick = s.tick
   const now = await $.clock.now()
+  // A timer set or cancelled while the clock was read (an extension, a retry, a turn) owns the window now;
+  // if that left no timer, a window still open is armed again rather than left without one.
+  if (s.tick !== tick) return s.pending || s.inFlight ? undefined : arm($, s)
+  // One fork at a time: the one already out re-arms when it settles. Checked after the await, and set
+  // below with no await in between, so two timers can never both send.
+  if (s.inFlight) return
   if (now >= s.deadline) return arm($, s)
-  // A turn in the meantime re-armed the timer; this callback is stale.
   if (isCold(s, now)) return arm($, s)
-  if (now - s.lastRequestAt < s.every - 1000) return
-  let reply
-  try {
-    reply = await $.model.fork({ prompt: PING_PROMPT })
-  } catch (err) {
-    return stop($, s, `the ping failed, ${err instanceof Error ? err.message : String(err)}`)
-  }
+  if (s.compacted || s.waitForTurn || !s.lastRequestAt) return arm($, s)
+  // A request since this timer was set moved the clock; schedule from it.
+  if (now - s.lastRequestAt < s.every - 1000) return arm($, s)
+  // A host that slept past a retry's slot must not send it inside the last minute.
+  if (s.retries && now >= s.lastRequestAt + TTL_MS - MIN_PING_MS) return stop($, s, s.retryReason + afterRetries(s.retries))
+  const gen = s.gen
+  const sentAt = s.lastRequestAt
+  s.inFlight = true
+  const sent = await $.model.fork({ prompt: PING_PROMPT }).then(reply => ({ reply }), (err: unknown) => ({ err }))
+  const at = await $.clock.now()
+  s.inFlight = false
+  // Checked after the last await. A stop, /clear, resume or compaction, or a main request that moved the
+  // cache clock, replaced what this fork was sent for: its reply is dropped and the window armed afresh.
+  if (gen !== s.gen || s.lastRequestAt !== sentAt) return s.pending ? undefined : arm($, s)
+  if ('err' in sent) return stop($, s, `the ping failed, ${sent.err instanceof Error ? sent.err.message : String(sent.err)}`)
+  const reply = sent.reply
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
   if (reply.isAnswered === false) {
-    const reason = reply.reason === 'nothing-to-fork' ? 'no conversation to warm yet'
-      : reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
+    // A restarted process has no conversation to fork until its first turn; the window waits for one instead of ending.
+    if (reply.reason === 'nothing-to-fork') {
+      s.waitForTurn = true
+      return arm($, s)
+    }
+    const reason = reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
       : reply.reason === 'aborted' ? 'the ping was interrupted'
       : 'the ping returned no text'
-    return stop($, s, reason)
+    // A busy or failing API is usually brief; retry while a ping can still land a minute before the cache goes cold.
+    if (reply.reason === 'api-error' && (reply.status === null || reply.status === 429 || reply.status >= 500)) {
+      const wait = MIN_PING_MS * 2 ** s.retries
+      if (s.retries < MAX_RETRIES && at + wait < Math.min(s.deadline, s.lastRequestAt + TTL_MS - MIN_PING_MS)) {
+        s.retries++
+        s.retryReason = reason
+        // Replaces any timer set while the fork was out, such as a window extension's, so only the retry fires.
+        disarm(s)
+        s.pending = $.clock.after(wait, () => { void ping($, s) })
+        updateStatus($, s, at)
+        return
+      }
+    }
+    return stop($, s, reason + afterRetries(s.retries))
   }
   const u = reply.usage
-  const price = priceOf(s.lastModel)
+  const price = priceOf(s.lastModel, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
   // A warm ping reads the prefix and writes only its own message; a write of a tenth of the read or more means the prefix broke.
   const warm = u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
   const usd = price ? pingUsd(u, price) : null
@@ -247,6 +336,10 @@ async function ping($: EngineInterface, s: State) {
   if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
   s.lastRequestAt = now
   await arm($, s)
+}
+
+function afterRetries(n: number): string {
+  return n ? ` after ${n} ${n === 1 ? 'retry' : 'retries'}` : ''
 }
 
 /** The reply to an arming command; on a cold cache it says when the first ping can come. */
@@ -290,6 +383,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, inFlight: false, stepWrites: null,
   }
 }
 
@@ -350,7 +444,7 @@ export const register: Register = on => {
     const savedEvery = await $.store.get(everyKey(s))
     const savedGuard = await $.store.get(KEY_GUARD)
     s.deadline = typeof saved === 'number' && saved > now ? saved : 0
-    s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS ? savedEvery : PING_AFTER_MS
+    s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS && savedEvery < TTL_MS ? savedEvery : PING_AFTER_MS
     s.guard = savedGuard === 'warn' ? 'warn' : 'refuse'
     s.always = (await $.store.get(KEY_ALWAYS)) === true
     // Always means a fresh default window every session, whatever the last one left behind.
@@ -381,12 +475,18 @@ export const register: Register = on => {
   // Resume fields seed the guard before any turn of the resumed session has run.
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
+    // A resumed or cleared conversation is not the one a ping in flight was sent for.
+    outdate(s)
     if (e.source === 'clear') {
       await stop($, s, null)
       s.stopped = null
       resetForClear(s)
       s.sid = await $.session.id()
-      updateStatus($, s, await $.clock.now())
+      // No session.start fires after /clear, so this is where always arms the new conversation.
+      if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      // A window armed while this handler awaited lost its timer to resetForClear; arm it again.
+      else if (s.deadline) await arm($, s)
+      else updateStatus($, s, await $.clock.now())
       return r
     }
     const line = seedFromResume(s, e, await $.clock.now())
@@ -419,12 +519,13 @@ export const register: Register = on => {
     }
     if (words[0] !== 'status') {
       const window = parseDuration(words[0])
-      if (window == null) return { text: 'keepwarm takes a window such as 6h or 90m, or always, off, or status' }
+      if (!window) return { text: 'keepwarm takes a window such as 6h or 90m, or always, off, or status' }
       // "every 2m" is a testing knob and lasts only for the window it was given with.
       let every = PING_AFTER_MS
       if (words[1] === 'every') {
         const period = parseDuration(words[2] ?? '')
-        if (period == null || period < MIN_PING_MS) return { text: 'every takes a period of at least 1m' }
+        // A period of the cache's whole hour or more would fire only once the cache is already cold.
+        if (period == null || period < MIN_PING_MS || period >= TTL_MS) return { text: 'every takes a period from 1m to 59m' }
         every = period
       }
       await startWindow($, s, window, every)
@@ -451,8 +552,10 @@ export const register: Register = on => {
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
-    if (s.guard === 'warn') {
-      $.ui.log(`${guardText(s, now)} Sending anyway; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
+    // A refused prompt that no person sent would be lost: nobody is there to send it again.
+    const unattended = UNATTENDED.has(e.origin.kind)
+    if (s.guard === 'warn' || unattended) {
+      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
@@ -467,7 +570,15 @@ export const register: Register = on => {
 
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) s.lastRequestAt = await $.clock.now()
-    yield* next(e)
+    const r = yield* next(e)
+    // Each request's write is priced at its own prompt length's tier (Haiku 5.5 changes price at 100k), not the turn's sum.
+    const u = r.usage
+    if (!e.agentId && u) {
+      const price = priceOf(u.model || e.model, u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens)
+      const was = s.stepWrites ?? { usd: 0, priced: true }
+      s.stepWrites = { usd: was.usd + (price ? u.cache_creation_input_tokens * price[1] / 1e6 : 0), priced: was.priced && price != null }
+    }
+    return r
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -477,8 +588,10 @@ export const register: Register = on => {
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
-    if (now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
+    // A turn aborted before it sent anything touched no cache, so it leaves the clock alone.
+    if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false
+    s.waitForTurn = false
     s.ackedAt = 0
     const u = e.usage
     if (u) {
@@ -492,8 +605,9 @@ export const register: Register = on => {
       s.ctx = live && live > 0 ? live : u.input_tokens + u.cache_read_input_tokens + write
       const full = prev > 20000 && write >= 0.5 * prev
       if (full || s.coldWritePending) {
-        const price = priceOf(s.lastModel)
-        const usd = price ? write * price[1] / 1e6 : null
+        // Priced per request when the steps reported usage; otherwise at the tier of the context the comeback re-sent.
+        const price = priceOf(s.lastModel, prev || s.ctx)
+        const usd = s.stepWrites?.priced ? s.stepWrites.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
         if (s.deadline < now + AUTO_WARM_MS) {
           await startWindow($, s, AUTO_WARM_MS, s.every)
@@ -502,6 +616,7 @@ export const register: Register = on => {
       }
     }
     s.coldWritePending = false
+    s.stepWrites = null
     await arm($, s)
     return r
   })
@@ -512,6 +627,7 @@ export const register: Register = on => {
       s.compacted = true
       s.ctx = 0
       s.ackedAt = 0
+      outdate(s)
       disarm(s)
       await arm($, s)
     }
