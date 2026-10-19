@@ -73,6 +73,8 @@ export type State = {
   retryReason: string
   gen: number
   tick: number
+  offs: number
+  turnOffs: number | null
   inFlight: boolean
   stepWrites: { usd: number; priced: boolean } | null
 }
@@ -233,6 +235,11 @@ async function prune($: EngineInterface, s: State, now: number) {
 }
 
 async function stop($: EngineInterface, s: State, why: string | null, forgetAlways = false) {
+  // Set before any await, so a window being opened at the same moment sees the off and does not write itself back.
+  if (forgetAlways) {
+    s.always = false
+    s.offs++
+  }
   s.deadline = 0
   s.every = PING_AFTER_MS
   s.stopped = why
@@ -241,10 +248,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
-  if (forgetAlways) {
-    s.always = false
-    await $.store.delete(KEY_ALWAYS)
-  }
+  if (forgetAlways) await $.store.delete(KEY_ALWAYS)
   updateStatus($, s, await $.clock.now())
 }
 
@@ -343,19 +347,37 @@ function afterRetries(n: number): string {
 }
 
 /** The reply to an arming command; on a cold cache it says when the first ping can come. */
+/** How long keepwarm holds the cache after a paid cold write: the rolling window when always is on. */
+function holdMs(s: State): number {
+  return s.always ? DEFAULT_WINDOW_MS : AUTO_WARM_MS
+}
+
 function armedText(s: State, now: number, windowMs: number): string {
   if (isCold(s, now)) return `keepwarm on for ${fmtDuration(windowMs)}. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn`
   return `keepwarm on for ${fmtDuration(windowMs)}, a ping ${fmtDuration(s.every)} after each idle stretch keeps the cache read, not re-written`
 }
 
-async function startWindow($: EngineInterface, s: State, windowMs: number, every: number) {
+// A /keepwarm off after `offs` was read wins: the window it cancelled is not written back. A caller that awaited
+// before deciding to open a window passes the count it read first.
+async function startWindow($: EngineInterface, s: State, windowMs: number, every: number, offs = s.offs) {
+  if (s.offs !== offs) return
   const now = await $.clock.now()
+  if (s.offs !== offs) return
+  const deadline = now + windowMs
   s.every = every
+  s.deadline = deadline
+  s.stopped = null
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
-  s.deadline = now + windowMs
-  s.stopped = null
-  await $.store.set(deadlineKey(s), s.deadline)
+  await $.store.set(deadlineKey(s), deadline)
+  if (s.offs !== offs) {
+    // Remove only what this call wrote; a window armed after the off is left alone.
+    if ((await $.store.get(deadlineKey(s))) === deadline) {
+      await $.store.delete(deadlineKey(s))
+      if (!s.deadline) await $.store.delete(everyKey(s))
+    }
+    return
+  }
   await arm($, s)
 }
 
@@ -369,7 +391,7 @@ function card(s: State, now: number): string {
   lines.push(`context     ${s.ctx.toLocaleString('en-US')} tokens`)
   lines.push(`cold cost   ${fmtUsd(coldUsd(s))} to re-write it (warm turn ${fmtUsd(warmUsd(s))})`)
   const always = s.always ? ' (always)' : ''
-  const idle = s.always ? 'off until the next session start, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
+  const idle = s.always ? 'off until the next turn, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
   lines.push(`keepwarm    ${s.deadline ? (statusText(s, now) ?? '').replace(/^keepwarm /, 'on, ') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
   const pings = breakEvenPings(s)
   if (pings != null) lines.push(`break-even  up to ${pings} pings at the read rate cost one cold write, about ${fmtDuration(pings * s.every)} of idle at one ping per ${fmtDuration(s.every)}`)
@@ -383,7 +405,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, inFlight: false, stepWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, turnOffs: null, inFlight: false, stepWrites: null,
   }
 }
 
@@ -504,14 +526,14 @@ export const register: Register = on => {
     if (words[0] === 'off') {
       const wasAlways = s.always
       await stop($, s, null, true)
-      return { text: wasAlways ? 'keepwarm is off, and no longer arms itself at session start' : 'keepwarm is off' }
+      return { text: wasAlways ? 'keepwarm is off, and always is off for every session from its next turn' : 'keepwarm is off' }
     }
     if (words[0] === 'always') {
       s.always = true
       await $.store.set(KEY_ALWAYS, true)
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
       const cold = isCold(s, now) ? `. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn` : ''
-      return { text: `keepwarm always on: every session starts with a ${fmtDuration(DEFAULT_WINDOW_MS)} window; /keepwarm off turns it off for good${cold}` }
+      return { text: `keepwarm always on: every session stays warm until ${fmtDuration(DEFAULT_WINDOW_MS)} after its last turn; /keepwarm off turns it off for good${cold}` }
     }
     if (!words.length) {
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
@@ -529,7 +551,8 @@ export const register: Register = on => {
         every = period
       }
       await startWindow($, s, window, every)
-      return { text: armedText(s, now, window) }
+      const rolls = s.always && (window < DEFAULT_WINDOW_MS || every !== PING_AFTER_MS)
+      return { text: armedText(s, now, window) + (rolls ? `. Always is on, so your next turn makes it at least ${fmtDuration(DEFAULT_WINDOW_MS)} at one ping per ${fmtDuration(PING_AFTER_MS)}` : '') }
     }
     return { text: statusText(s, now) ?? 'keepwarm is off' }
   })
@@ -555,7 +578,7 @@ export const register: Register = on => {
     // A refused prompt that no person sent would be lost: nobody is there to send it again.
     const unattended = UNATTENDED.has(e.origin.kind)
     if (s.guard === 'warn' || unattended) {
-      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
+      $.ui.log(`${guardText(s, now)} Sending anyway${unattended ? `, since this ${e.origin.kind} prompt cannot be sent again` : ''}; keepwarm will hold the cache for ${fmtDuration(holdMs(s))} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
@@ -565,11 +588,15 @@ export const register: Register = on => {
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(AUTO_WARM_MS)}. Or /clear and start from a note.` }
+    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear and start from a note.` }
   })
 
   on('turn.step', async function* ($, e, next) {
-    if (!e.agentId) s.lastRequestAt = await $.clock.now()
+    if (!e.agentId) {
+      // The off count when the turn's first request went out: an off after it wins over what the turn opens.
+      if (e.index === 0) s.turnOffs = s.offs
+      s.lastRequestAt = await $.clock.now()
+    }
     const r = yield* next(e)
     // Each request's write is priced at its own prompt length's tier (Haiku 5.5 changes price at 100k), not the turn's sum.
     const u = r.usage
@@ -584,6 +611,10 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId) return r
+    // An off at any point in this turn wins over every window the turn would open; a host that raised no
+    // step falls back to the count at completion.
+    const offs = s.turnOffs ?? s.offs
+    s.turnOffs = null
     const now = await $.clock.now()
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
@@ -593,6 +624,15 @@ export const register: Register = on => {
     s.compacted = false
     s.waitForTurn = false
     s.ackedAt = 0
+    // Always covers any break up to six hours after a turn that reached the cache (a turn that failed before any
+    // response touched nothing, and its cache may be cold): a window of at least six hours at the default period,
+    // which brings back a stopped window and replaces a shorter one or a testing period. Another session's
+    // /keepwarm off or /keepwarm always changes the shared switch, so every such turn reads it.
+    if (e.usage) {
+      const shared = (await $.store.get(KEY_ALWAYS)) === true
+      if (s.offs === offs) s.always = shared
+      if (s.always) await startWindow($, s, Math.max(DEFAULT_WINDOW_MS, s.deadline - now), PING_AFTER_MS, offs)
+    }
     const u = e.usage
     if (u) {
       if (u.model) s.lastModel = u.model
@@ -609,10 +649,10 @@ export const register: Register = on => {
         const price = priceOf(s.lastModel, prev || s.ctx)
         const usd = s.stepWrites?.priced ? s.stepWrites.usd : price ? write * price[1] / 1e6 : null
         s.misses.push({ at: now, tokens: write, usd })
-        if (s.deadline < now + AUTO_WARM_MS) {
-          await startWindow($, s, AUTO_WARM_MS, s.every)
-          $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}). Keeping the cache warm for ${fmtDuration(AUTO_WARM_MS)} so it is not paid again today; /keepwarm off to stop.`)
-        }
+        const extend = s.deadline < now + AUTO_WARM_MS && s.offs === offs
+        if (extend) await startWindow($, s, AUTO_WARM_MS, s.every, offs)
+        $.ui.log(`cold write of ${fmtTok(write)} tokens paid (${fmtUsd(usd)}).` +
+          (extend ? ` Keeping the cache warm for ${fmtDuration(AUTO_WARM_MS)} so it is not paid again today; /keepwarm off to stop.` : ''))
       }
     }
     s.coldWritePending = false
