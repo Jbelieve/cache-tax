@@ -1,0 +1,21 @@
+hooks/register.ts
+  s_f5f96414361352::t_32fb242fefe8a2 15-17,263-266,687-689,691,696
+tests/register.test.ts
+  s_f5f96414361352::t_3bf278e30893b6 337-360
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9bb5582c4e6762a15ef488438daf3167c76624ed",
+  "prompts": {},
+  "sessions": {
+    "s_f5f96414361352": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "57d541b6-c7a2-4868-91a0-1f62839b3bfe",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Jbelieve <jorge@believe-global.com>"
+    }
+  }
+}
