@@ -334,6 +334,30 @@ describe('guard', () => {
     expect(w.entered).toEqual(['hi'])
   })
 
+  test('a resend from a new process, as claude -p starts per turn, goes through', async ($, on) => {
+    mock.clock(on, { now: 10 * HOUR })
+    // The refused send's process stored its ack; this one rebuilds the last request time a second later.
+    const store = new Map<string, unknown>([['acked:S1', 8 * HOUR + 1000]])
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.classic.SessionStart({ session_id: 'S1', source: 'resume', seconds_since_last_response: 7200, context_tokens: 200000, prompt_cache_likely_expired: true })
+    const resend = await $.prompt.submit(prompt('hi'))
+    expect(resend.drop).toBe(undefined)
+    expect(w.entered).toEqual(['hi'])
+    expect(store.has('acked:S1')).toBe(false)
+  })
+
+  test('a refusal is stored for the next process', async ($, on) => {
+    mock.clock(on, { now: 10 * HOUR })
+    const store = new Map<string, unknown>()
+    world(on, [], { store })
+    await $.session.start(session)
+    await $.classic.SessionStart({ session_id: 'S1', source: 'resume', seconds_since_last_response: 7200, context_tokens: 200000, prompt_cache_likely_expired: true })
+    const first = await $.prompt.submit(prompt('hi'))
+    expect(first.drop).toMatch(/cache-tax: the prompt cache went cold/)
+    expect(store.get('acked:S1')).toBe(8 * HOUR)
+  })
+
   test('lets slash commands, warm sends and small contexts through', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])

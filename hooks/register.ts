@@ -12,6 +12,9 @@ const PING_PROMPT = 'Reply with the single word: warm'
 const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
+const KEY_ACKED = 'acked'
+// A resumed process rebuilds the last request time from whole seconds, so the refused send's time is matched within this.
+const ACK_SLACK_MS = 60 * 1000
 const KEY_ALWAYS = 'always'
 
 // Prompts no person sent, so nobody could send them again after a refusal. Every
@@ -255,6 +258,10 @@ function deadlineKey(s: State): string {
 
 function everyKey(s: State): string {
   return `${KEY_EVERY}:${s.sid}`
+}
+
+function ackedKey(s: State): string {
+  return `${KEY_ACKED}:${s.sid}`
 }
 
 /** Clears this session's own dead window and the bare keys a store written before 2.1.1 still holds. Other sessions' keys are never touched: a read followed by a delete cannot be made atomic against their renewal. */
@@ -677,12 +684,16 @@ export const register: Register = on => {
       s.coldWritePending = true
       return next(e)
     }
-    if (s.ackedAt === s.lastRequestAt) {
+    // Hosts that start a process per turn (claude -p) lose the in-memory ack, so the refusal is also kept in the store.
+    const acked = await $.store.get(ackedKey(s))
+    if (s.ackedAt === s.lastRequestAt || (typeof acked === 'number' && Math.abs(acked - s.lastRequestAt) < ACK_SLACK_MS)) {
       s.ackedAt = 0
+      await $.store.delete(ackedKey(s))
       s.coldWritePending = true
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
+    await $.store.set(ackedKey(s), s.lastRequestAt)
     return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(holdMs(s))}. Or /clear and start from a note.` }
   })
 
